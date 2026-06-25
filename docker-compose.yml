@@ -1,0 +1,22 @@
+services:
+  ccnu-library-mcp:
+    build: .
+    image: mcp-ccnu-lib
+    container_name: ccnu-library-mcp
+    # .env 提供账号等机密；下方 environment 覆盖非机密配置，
+    # 避免 env_file 对带引号的 URL 处理不一致（CCNU_BASE_URL 含 # hash 路由）。
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      HEADLESS: "true"
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8010"
+      CCNU_BASE_URL: "https://kjyy.ccnu.edu.cn/jsq-v/#/main/home"
+      CHALLENGE_TTL_SECONDS: "240"
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./data:/data        # 持久化 profile / cookies / SQLite / 截图，重启后免登录
+    shm_size: "1gb"         # Chromium 共享内存，过小会随机崩页
+    restart: unless-stopped

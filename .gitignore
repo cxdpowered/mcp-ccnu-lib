@@ -1,0 +1,17 @@
+# 凭证与运行数据，绝不入库
+.env
+/data/
+*.sqlite
+*.sqlite-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# 探测/调试产物
+/scripts/_probe_out/
+screenshots/

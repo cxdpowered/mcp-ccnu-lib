@@ -1,0 +1,11 @@
+# 构建上下文排除：机密、运行数据、探测产物、本地缓存
+.env
+data/
+scripts/_probe_out/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.git/
+.pytest_cache/
