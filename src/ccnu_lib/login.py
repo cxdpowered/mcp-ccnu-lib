@@ -47,18 +47,21 @@ async def is_logged_in(page: Page) -> bool:
     return False
 
 
-async def _wait_settled(page: Page, seconds: float = 20.0) -> str:
+async def _wait_settled(page: Page, seconds: float = 15.0) -> str:
     """等 CAS 重定向/SSO 链稳定，返回 'logged_in' 或 'login_form'。
 
     关键：不能一看到 kjyy 域就判已登录——未登录时会先闪一下 kjyy 再跳回 CAS。
-    要求 kjyy 域 URL 稳定约 1s 且无密码框，才算真登录。
+    要求回到 kjyy 域且 SPA 已存好 token，才算真登录。
+
+    轮询 0.25s 一次并尽早短路：哪个状态先确定就立刻返回，不傻等满超时。
     """
-    for _ in range(int(seconds / 0.5)):
+    step = 0.25
+    for _ in range(int(seconds / step)):
         if await _visible(page, S.PASSWORD_INPUT):
             return "login_form"  # 渲染出密码框 = 确定要登录
         if S.LOGGED_IN_HOST in (page.url or "") and await _has_token(page):
             return "logged_in"   # 回到 kjyy 且 SPA 已存好 token
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(step)
     if await _visible(page, S.PASSWORD_INPUT):
         return "login_form"
     return "timeout"
@@ -77,9 +80,14 @@ async def _error_text(page: Page) -> str | None:
 
 # ---------- 提交后竞速判定 ----------
 async def _evaluate_after_submit(db: Database, sess: Session) -> dict:
-    """点击登录后，竞速等待：成功 / 短信页 / 错误，最多约 12s。"""
+    """点击登录后，竞速等待：成功 / 短信页 / 错误，最多约 12s。
+
+    轮询 0.25s 并尽早短路：登录成功通常 1~3s 内 token 就进 sessionStorage，
+    一旦命中立刻返回，不傻等满超时。
+    """
     page = sess.page
-    for _ in range(24):  # 24 * 0.5s
+    step = 0.25
+    for _ in range(int(12 / step)):
         if await is_logged_in(page):
             return await _mark_success(db, sess)
         if await _visible(page, S.SMS_INPUT):
@@ -92,7 +100,7 @@ async def _evaluate_after_submit(db: Database, sess: Session) -> dict:
             db.update_session(sess.user_key, status="login_failed", error=err)
             return {"ok": False, "code": "LOGIN_FAILED",
                     "message": f"登录失败：{err}（验证码已刷新，请重新 start_login）"}
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(step)
     # 既没成功也没明确失败：交人工兜底
     res = await create_challenge(
         db, page, sess.user_key, "manual_login",

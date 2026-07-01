@@ -177,3 +177,19 @@ async def make_stop(s: Session) -> Any:
 async def find_common_seat(s: Session) -> Any:
     """网站常用/收藏座位。"""
     return await call(s, "res/findCommonSeat")
+
+
+async def breach(s: Session, page: int = 1, page_size: int = 20) -> Any:
+    """违约记录。返回 {list,count}，list 元素为 make 记录（含 makeDateStr/makeEndStr 等）。"""
+    return await call(s, f"user/breach/{page}/{page_size}")
+
+
+async def history(s: Session, page: int = 1, page_size: int = 20) -> Any:
+    """历史预约记录。返回 {list,count}，list 元素为 make 记录。"""
+    return await call(s, f"user/history/{page}/{page_size}")
+
+
+async def door_log(s: Session, date: str) -> Any:
+    """某天闸机进出记录。date 必须 yyyy-MM-dd。
+    返回 [{username,dateTimeStr,gateNo,doorName,direction(0入/1出),type}]，按时间倒序。"""
+    return await call(s, f"user/doorLog/{date}")

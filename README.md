@@ -181,13 +181,17 @@ challenge 不是登录专属，而是贯穿所有工具的**通用中断模型**
 | `submit_challenge` | challenge_id, answer | 提交验证码/短信，续跑挂起流程 | |
 | `get_availability_distribution` | date, start_time, end_time, library?, area_filter? | 各区域可用座位分布（按空闲降序） | |
 | `list_available_seats` | date, start_time, end_time, **location_id**, area_filter?, limit? | 某区域具体可用座位 | |
+| `get_seat_layout` | **location_id** | 区域座位平面图（网页版布局透传 + 扁平座位表） | |
 | `reserve_seat` | date, start_time, end_time, seat_id?, location_id?, strategy? | 提交预约 | ✅ |
 | `cancel_reservation` | reservation_id? | 取消未开始预约（缺省取当前有效） | ✅ |
 | `get_current_reservation` | — | 当前预约 + 状态 + 暂离详情 | |
-| `start_temporary_leave` | reservation_id? | 暂离 | ✅ |
-| `return_from_temporary_leave` | reservation_id? | 回座 | ✅ |
+| `start_temporary_leave` | reservation_id? | 暂离（网页按钮镜像；正常暂离过闸机自动，见下） | ✅ |
+| `return_from_temporary_leave` | reservation_id? | 回座（同上，正常回座过闸机自动） | ✅ |
 | `end_reservation_early` | reservation_id? | 提前结束/退座（区别于取消未开始） | ✅ |
 | `get_site_favorite_locations` | — | 网站常用/收藏座位 | |
+| `get_violation_records` | page?, page_size? | 违约记录（爽约/暂离超时等），分页 | |
+| `get_reservation_history` | page?, page_size? | 历史预约记录（过往全部），分页 | |
+| `get_door_log` | **date** | 某天闸机进出记录（可靠判断在馆/暂离） | |
 
 ---
 
@@ -299,9 +303,9 @@ challenge 不是登录专属，而是贯穿所有工具的**通用中断模型**
 
 #### `get_current_reservation`
 
-查询当前预约及状态（优先返回活跃预约，否则返回最近一条）。
+查询当前**有效**预约及状态。只在存在活跃预约（`reserved` / `waiting_sign_in` / `in_use` / `away` / `violation_risk`）时返回座位明细；否则返回干净的 `none`，**不会回显已取消/已结束那条的座位信息**——调用方判断"有没有座位"一律看 `status`，不要看 `seat_no`。
 
-**成功（无预约）**：`{ "ok": true, "status": "none", "message": "当前无预约" }`
+**成功（无有效预约）**：`{ "ok": true, "status": "none", "message": "当前无有效预约", "last_raw_status": "CANCEL" }`（`last_raw_status` 仅排查用，为最近一条记录的后端原始状态，可能不存在）
 **成功（有预约）**：
 ```json
 { "ok": true, "reservation_id": "...", "status": "away", "raw_status": "AWAY",
@@ -312,12 +316,66 @@ challenge 不是登录专属，而是贯穿所有工具的**通用中断模型**
   "away_raw": { "...": "..." },
   "actual_begin": "...", "actual_end": null }
 ```
-`status` 枚举：`none` / `reserved` / `waiting_sign_in` / `in_use` / `away` / `ended` / `cancelled` / `violation_risk` / `unknown`。`away_*` 仅暂离/使用中时出现。
+`status` 枚举：`none` / `reserved` / `waiting_sign_in` / `in_use` / `away` / `ended` / `cancelled` / `violation` / `violation_risk` / `unknown`。`away_*` 仅暂离/使用中时出现。
+- `ended`：正常用完 / 主动结束 / 管理员改判完成（后端 raw `STOP`）。
+- `violation`：**已发生的违约**（后端 raw `MISS` 爽约未签到 / `LEAVE_EARLY` 暂离超时未归）。终态，不算活跃预约。
+- `violation_risk`：进行中的违约风险（raw `BREAK`/`VIOLATION` 等），仍算活跃。
+
 **错误码**：`NEED_LOGIN`
 
 #### `get_site_favorite_locations`
 
-返回网站里的常用/收藏座位（原始结构）。**成功**：`{ "ok": true, "favorites": ... }`；**错误码**：`NEED_LOGIN`
+返回网站里的常用/收藏座位（原始结构，含 `roomId`/`label`/`buildName`/`floorName`/`roomName` 等）。**成功**：`{ "ok": true, "favorites": [...] }`；**错误码**：`NEED_LOGIN`
+
+#### `get_seat_layout`
+
+透传网页版某区域的座位平面布局（Fabric.js 画布数据），并附一份扁平座位表方便辅助选座。参数 `location_id`（必填，取自 `get_availability_distribution`）。
+
+```json
+{ "ok": true, "location_id": "1995338594917990400", "layout_version": "15",
+  "seat_count": 172,
+  "seats": [ { "seat_id": "2003722571020177408", "seat_no": "N1167",
+              "name": "1行1列", "direction": "top", "power": true,
+              "x": 33.0, "y": 148.0 } ],
+  "layout": { "version": "5.2.1", "objects": [...], "backgroundImage": {...} } }
+```
+
+- `seats`：从画布抽出的扁平座位表（`seat_id`/`seat_no`/`name` 行列/`direction`/`power` 是否有电源/`x,y` 画布坐标）——小青团可直接据此辅助选座，无需解析画布。
+- `layout`：网页版原始 Fabric 画布对象（已剥掉后端尾部 `_updVersion_N` 标记并解析成对象），需要在前端渲染座位图时用；纯文字场景用 `seats` 即可。
+- 注意：该布局是**静态座位表**，不含实时空闲状态；查空闲仍用 `list_available_seats`（可与 `seats` 按 `seat_id` 关联）。
+
+**错误码**：`NEED_LOCATION`、`NEED_LOGIN`
+
+#### `get_violation_records` / `get_reservation_history`
+
+分页拉取违约记录 / 历史预约记录。参数 `page`（默认 1）、`page_size`（默认 20）。
+
+```json
+{ "ok": true, "page": 1, "page_size": 20, "total": 15, "count": 15,
+  "records": [ { /* 同 get_current_reservation 的记录结构：reservation_id/status/raw_status/seat_no/path/date/start_time/end_time/receipt/raw_text */ } ] }
+```
+
+- `total` = 后端总条数（用于分页），`count` = 本页返回条数。
+- 每条 `record` 复用统一映射：违约记录里 `raw_text` 常带原因（如"用户暂离超时未归, 预约释放"），`status` 映射为 `violation`；历史里正常完成的为 `ended`、取消的为 `cancelled`。
+- 小青团可用 `get_violation_records` 的 `total` 做违约次数提醒。
+
+**错误码**：`NEED_LOGIN`
+
+#### `get_door_log`
+
+某天(`date`=`yyyy-MM-dd`，必填)的闸机进出记录。
+
+```json
+{ "ok": true, "date": "2026-07-01", "count": 2, "in_building": false,
+  "events": [ { "time": "2026-07-01 15:17:14", "gate": "南湖二楼中出", "direction": "out", "raw_direction": 1 },
+              { "time": "2026-07-01 15:12:44", "gate": "南湖二楼右入", "direction": "in", "raw_direction": 0 } ] }
+```
+
+- `events` 按时间**倒序**（首条最新）；`direction`：`in`(进=`raw_direction 0`) / `out`(出=`1`)。
+- `in_building`：由首条方向推断当前是否在馆（`true`=在馆）。
+- **为何需要**：实测**物理暂离（走闸机出馆）不会实时改预约状态**——`get_current_reservation` 仍是 `in_use`、`awayTimeM` 仍 0（系统疑似回馆才结算离馆时长）。所以小青团判断"用户在不在馆/是否暂离"要靠这个接口，不能只看预约状态。
+
+**错误码**：`NEED_LOGIN`
 
 ---
 
@@ -372,19 +430,55 @@ challenge 不是登录专属，而是贯穿所有工具的**通用中断模型**
 
 成功结构：`{ "ok": true, "status": "away", "message": "...", "raw": {...} }`（`raw` 为后端原始返回，若有）。
 
-> 这三个工具与 `cancel_reservation` 都接受可选 `reservation_id`，但当前实现以"当前预约"为准操作，`reservation_id` 主要用于调用方自查比对。
+> **重要（真机确认）**：**暂离 / 回座 实际是过闸机自动触发的**——走出馆=自动暂离、走回馆=自动回座，用户根本不点按钮。因此：
+> - `start_temporary_leave` / `return_from_temporary_leave` 只是网页手动按钮的镜像，**不是暂离/回座的正常路径**，小青团一般不用调；且物理暂离**不会实时改预约状态**（`get_current_reservation` 仍显示 `in_use`、`awayTimeM` 仍 0）。
+> - **要判断用户是否暂离/已回座，用 `get_door_log` 轮询**（最后一条 `out`=已出馆暂离，`in`=在馆），而不是看预约状态。
+> - `end_reservation_early`（`make/stop` 提前退座）**已真机验证可用**：在馆外 `in_use` 时调用会正常结束（终态 `ended`，不产生违约）。
+>
+> 三个工具与 `cancel_reservation` 都接受可选 `reservation_id`，但当前实现以"当前预约"为准操作，`reservation_id` 主要用于调用方自查比对。
 
 ---
 
-### 典型调用顺序
+### 对接交互流程（小青团侧，已真机实测 2026-06-30）
+
+下面是把本服务真正驱动起来的完整交互方式。两条闭环都已在校园网真机跑通（登录含图形验证码、预约 / 取消 / 重订）。
+
+#### A. 登录闭环（带 challenge 的通用模式）
+
+登录态会过期；任何业务工具内部会先尝试静默 SSO 复登，复登失败才返回 `NEED_LOGIN`，此时转登录闭环：
 
 ```text
-get_availability_distribution → 选区域 location_id
-list_available_seats(location_id) → 选 seat_id
-reserve_seat(seat_id 或 location_id+strategy)
-get_current_reservation（轮询状态 / 暂离提醒）
-end_reservation_early / cancel_reservation
+start_login
+  └─ ok:true                      → 已登录，继续业务
+  └─ NEED_CHALLENGE(captcha/sms)  → 把 image_base64 发给用户看，收用户输入
+        └─ submit_challenge(challenge_id, answer)
+              └─ ok:true                → 登录成功
+              └─ NEED_CHALLENGE(...)    → 还有下一步挑战（如确认发短信→输短信码），循环
+              └─ LOGIN_FAILED           → 账号/验证码错；验证码已刷新，需重新 start_login
 ```
+
+要点（实测结论）：
+- **挑战图就是验证码那一小张**（已裁剪，非整页），`image_base64` 原样转发用户即可。
+- 同一 `user_key` 同一时刻只允许一个挂起 challenge；存在挂起时其它动作返回 `CHALLENGE_PENDING`。
+- 挂起态在内存，**服务进程重启即失效**，需重新发起；challenge 也有 `CHALLENGE_TTL_SECONDS` 超时。
+- 刚登录过、cookie 新鲜时，下次通常能静默 SSO 免验证码。
+
+#### B. 预约 / 取消闭环
+
+```text
+get_availability_distribution(date,start,end, library?/area_filter?)  → 选区域 location_id
+list_available_seats(location_id)                                     → 选 seat_id（或交给 strategy 自动选）
+reserve_seat(seat_id 或 location_id+strategy)                         → 返回 reservation_id / seat_no / receipt
+get_current_reservation()                                             → 轮询状态、读签到窗口、暂离提醒
+cancel_reservation()           # 不传 id 自动取当前活跃预约（已实测）
+  或 end_reservation_early()    # 使用中提前退座
+```
+
+关键字段语义（供小青团做提醒/判断）：
+- `reserve_seat` / `get_current_reservation` 成功结构里的 **`raw_text` 携带签到窗口**，如 `"请在 07:30 至 08:30 之间完成签到"`——小青团据此设签到提醒。
+- 判断"当前有没有座位"**只看 `status`**：`none` 即无有效预约（此时不应读 `seat_no`/`receipt`，那些字段已被清掉）。
+- `seat_no` 形如 `N1143`（馆区前缀 + 4 位），`receipt` 形如 `3533-0072-N1143`，每次预约都会变。
+- 取消后该预约 `raw_status` 变 `CANCEL`，`get_current_reservation` 即回 `status:none`。
 
 ---
 
@@ -414,7 +508,7 @@ end_reservation_early / cancel_reservation
 ## 7. 已知边界
 
 - 仅校园网内可用；登录态可保活一段时间，偶发图形验证码、有时需短信验证。
-- 签到 / 暂离 / 回座物理上由进出馆闸机自动触发；网页手动按钮（暂离 / 回座 / 退座）已接入，但**服务端是否允许手动操作取决于当前状态**，在馆"使用中"时才能真机确认。
+- 签到 / 暂离 / 回座物理上由进出馆闸机自动触发（真机确认）：进馆自动签到、出馆自动暂离、再进馆自动回座，用户不点按钮。且**物理暂离不实时改预约状态**——判断在馆/暂离用 `get_door_log` 轮询，别看 `get_current_reservation` 状态。网页手动按钮的镜像 `start_temporary_leave` / `return_from_temporary_leave` 仅备用，正常流程用不到；`end_reservation_early`（提前退座）已真机验证可用。
 - 续约官方要求到现场预约终端刷卡，网页端无入口，本服务不提供。
 - 违约红线：每月 3 次违约进黑名单一周。自动取消 / 退座的预授权与确认由小青团控制，**本服务只执行，不判断**。
 

@@ -16,17 +16,35 @@ from .db import Database
 _STATUS = {
     "RESERVE": "reserved",
     "USING": "in_use", "USE": "in_use", "SIGN": "in_use", "SIGNED": "in_use",
+    "CHECK_IN": "in_use", "CHECKIN": "in_use", "SIGN_IN": "in_use",  # 闸机签到=使用中(真机实测)
     "AWAY": "away", "LEAVE": "away",
     "END": "ended", "FINISH": "ended", "OVER": "ended", "COMPLETE": "ended",
+    "STOP": "ended",  # 完成使用 / 主动结束 / 管理员改判完成（真机实测）
     "CANCEL": "cancelled",
     "BREAK": "violation_risk", "VIOLATION": "violation_risk",
     "ILLEGAL": "violation_risk", "BREACH": "violation_risk",
+    # 已发生的违约（终态，非 active）——真机 breach/history 实测出现
+    "MISS": "violation", "NOSHOW": "violation", "NO_SHOW": "violation",
+    "LEAVE_EARLY": "violation", "LEAVEEARLY": "violation", "AWAY_TIMEOUT": "violation",
 }
 _ACTIVE = {"reserved", "waiting_sign_in", "in_use", "away", "violation_risk"}
 
 
 def _map_status(s: str | None) -> str:
     return _STATUS.get((s or "").upper(), "unknown")
+
+
+def _recency_key(m: dict):
+    """user/lastMake 返回列表并非按时间倒序，需自己按 (日期, 起始分钟) 排最近。"""
+    try:
+        d = int(m.get("makeDate") or 0)
+    except (TypeError, ValueError):
+        d = 0
+    return (d, m.get("makeBegin") or 0)
+
+
+def _most_recent(makes: list[dict]) -> dict | None:
+    return max(makes, key=_recency_key) if makes else None
 
 
 def _fmt_make(rec: dict) -> dict:
@@ -227,16 +245,23 @@ async def get_current_reservation(db: Database, uk: str) -> dict:
     if err:
         return err
     makes = await api.last_make(sess)
-    if not makes:
-        return {"ok": True, "status": "none", "message": "当前无预约"}
-    active = next((m for m in makes if _map_status(m.get("status")) in _ACTIVE), None)
-    rec = active or makes[0]
+    active = next((m for m in (makes or [])
+                   if _map_status(m.get("status")) in _ACTIVE), None)
+    if not active:
+        # 无有效预约：返回干净的 none，不回显最近一条(已取消/结束)的座位明细，
+        # 否则调用方会误以为还有 N1143 这种座位。只留一个原始状态痕迹供排查。
+        out = {"ok": True, "status": "none", "message": "当前无有效预约"}
+        recent = _most_recent(makes or [])
+        if recent:
+            out["last_raw_status"] = recent.get("status")
+        return out
+    rec = active
     out = _fmt_make(rec)
     out["ok"] = True
-    if not active:
-        out["status"] = "none" if out["status"] in ("cancelled", "ended") else out["status"]
-    # 暂离/使用中详情：暴露所有 away* 字段 + 实际起止，供小青团判断与提醒
-    away = {k: v for k, v in rec.items() if "away" in k.lower() and v not in ("", None)}
+    # 暂离/使用中详情：暴露非空的 away* 字段 + 实际起止，供小青团判断与提醒
+    # （awayTimeM=0 / -1 等"未暂离"占位值不算，避免误报有暂离）
+    away = {k: v for k, v in rec.items()
+            if "away" in k.lower() and v not in ("", None, 0, "0", -1, "-1")}
     if away:
         out["away_raw"] = away
         out["away_deadline"] = (rec.get("awayDeadline") or rec.get("awayEndTime")
@@ -294,3 +319,110 @@ async def get_site_favorite_locations(db: Database, uk: str) -> dict:
         return err
     data = await api.find_common_seat(sess)
     return {"ok": True, "favorites": data}
+
+
+# ---------- 座位图（透传网页版布局）----------
+def _parse_layout(raw: Any) -> tuple[Any, str | None, list[dict]]:
+    """后端 querySeatLayout 返回 `<Fabric-JSON>_updVersion_{N}` 字符串（网页版画布数据）。
+
+    剥掉尾部 `_updVersion_N` 标记，解析出 Fabric 对象；再从 objects 抽一份扁平座位表
+    （每个 object 都带 seat 子对象 + 画布坐标），方便调用方辅助选座而不必自己解画布。
+    返回 (layout_obj, version, seats)。解析失败则原样返回 raw。
+    """
+    version = None
+    obj = raw
+    if isinstance(raw, str):
+        try:
+            obj, end = json.JSONDecoder().raw_decode(raw)
+            suffix = raw[end:]
+            if "_updVersion_" in suffix:
+                version = suffix.split("_updVersion_", 1)[1].strip() or None
+        except Exception:
+            return raw, None, []
+    seats: list[dict] = []
+    if isinstance(obj, dict):
+        for o in obj.get("objects", []) or []:
+            s = o.get("seat") if isinstance(o, dict) else None
+            if not s:
+                continue
+            seats.append({
+                "seat_id": s.get("id"),
+                "seat_no": s.get("label"),
+                "name": s.get("name"),          # 形如 "3行1列"
+                "direction": s.get("direction"),
+                "power": s.get("power"),
+                "x": o.get("left"),
+                "y": o.get("top"),
+            })
+    return obj, version, seats
+
+
+async def get_seat_layout(db: Database, uk: str, location_id: str) -> dict:
+    """透传网页版某区域(room)的座位平面布局，并附一份扁平座位表供辅助选座。"""
+    if not location_id:
+        return {"ok": False, "code": "NEED_LOCATION",
+                "message": "请传 location_id（先调 get_availability_distribution 取区域）"}
+    sess, err = await _require_login(db, uk)
+    if err:
+        return err
+    raw = await api.query_seat_layout(sess, location_id)
+    layout, version, seats = _parse_layout(raw)
+    return {"ok": True, "location_id": location_id, "layout_version": version,
+            "seat_count": len(seats), "seats": seats, "layout": layout}
+
+
+# ---------- 违约记录 / 历史预约 ----------
+def _unwrap_list(data: Any) -> tuple[list[dict], int | None]:
+    """后端分页信封 {list,count}；也兼容直接返回 list 的情况。"""
+    if isinstance(data, dict):
+        lst = data.get("list") or []
+        return lst, data.get("count")
+    if isinstance(data, list):
+        return data, len(data)
+    return [], None
+
+
+async def get_violation_records(db: Database, uk: str,
+                                page: int = 1, page_size: int = 20) -> dict:
+    sess, err = await _require_login(db, uk)
+    if err:
+        return err
+    data = await api.breach(sess, page, page_size)
+    lst, count = _unwrap_list(data)
+    records = [_fmt_make(r) for r in lst]
+    return {"ok": True, "page": page, "page_size": page_size,
+            "total": count, "count": len(records), "records": records}
+
+
+async def get_reservation_history(db: Database, uk: str,
+                                  page: int = 1, page_size: int = 20) -> dict:
+    sess, err = await _require_login(db, uk)
+    if err:
+        return err
+    data = await api.history(sess, page, page_size)
+    lst, count = _unwrap_list(data)
+    records = [_fmt_make(r) for r in lst]
+    return {"ok": True, "page": page, "page_size": page_size,
+            "total": count, "count": len(records), "records": records}
+
+
+# ---------- 闸机进出记录（可靠判断在馆/暂离）----------
+async def get_door_log(db: Database, uk: str, date: str) -> dict:
+    """某天闸机进出记录。物理暂离不改预约状态，判断在馆与否要看这里的最后一条方向。"""
+    sess, err = await _require_login(db, uk)
+    if err:
+        return err
+    raw = await api.door_log(sess, date)
+    logs = raw if isinstance(raw, list) else (raw or [])
+    events = [{
+        "time": e.get("dateTimeStr"),
+        "gate": e.get("gateNo"),
+        "direction": "out" if e.get("direction") == 1 else "in",
+        "raw_direction": e.get("direction"),
+    } for e in logs]
+    # 记录默认按时间倒序，取首条判断当前是否在馆
+    in_building = None
+    if events:
+        in_building = events[0]["direction"] == "in"
+    return {"ok": True, "date": date, "count": len(events),
+            "in_building": in_building, "events": events}

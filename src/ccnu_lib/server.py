@@ -142,6 +142,35 @@ async def get_site_favorite_locations(user_key: str | None = None) -> dict:
     return await reservations.get_site_favorite_locations(db, _uk(user_key))
 
 
+@mcp.tool()
+async def get_seat_layout(location_id: str, user_key: str | None = None) -> dict:
+    """透传网页版某区域(location_id)的座位平面布局原始数据，用于渲染座位图/辅助选座。"""
+    return await reservations.get_seat_layout(db, _uk(user_key), location_id)
+
+
+@mcp.tool()
+async def get_door_log(date: str, user_key: str | None = None) -> dict:
+    """某天(yyyy-MM-dd)闸机进出记录。物理暂离不改预约状态，判断是否在馆看这里
+    (in_building=最后一条是否为入)。events: [{time,gate,direction(in/out)}]。"""
+    return await reservations.get_door_log(db, _uk(user_key), date)
+
+
+@mcp.tool()
+async def get_violation_records(
+    user_key: str | None = None, page: int = 1, page_size: int = 20,
+) -> dict:
+    """违约记录（爽约/超时未签到等），分页。records 为映射后的预约记录列表。"""
+    return await reservations.get_violation_records(db, _uk(user_key), page, page_size)
+
+
+@mcp.tool()
+async def get_reservation_history(
+    user_key: str | None = None, page: int = 1, page_size: int = 20,
+) -> dict:
+    """历史预约记录（已结束/取消/违约的所有过往预约），分页。"""
+    return await reservations.get_reservation_history(db, _uk(user_key), page, page_size)
+
+
 def main() -> None:
     # FastMCP 自带事件循环；浏览器在首个工具调用时惰性启动（get_session 内 await start）。
     mcp.run(transport="streamable-http")
