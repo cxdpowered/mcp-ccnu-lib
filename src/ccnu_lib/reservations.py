@@ -9,7 +9,7 @@ import random
 from typing import Any
 
 from . import api, login
-from .browser import Session, manager
+from .http_client import Session, manager
 from .db import Database
 
 # 后端 status → 需求枚举
@@ -68,9 +68,14 @@ def _fmt_make(rec: dict) -> dict:
 # ---------- 登录态保障 ----------
 async def _require_login(db: Database, uk: str) -> tuple[Session | None, dict | None]:
     sess = await manager.get_session(uk)
-    if await login._has_token(sess.page):
+    if sess.token:  # 已有 app token：确保签名密钥就绪即可直接用
+        if not sess.realkey:
+            try:
+                await login.ensure_syscfg(sess)
+            except Exception:
+                pass
         return sess, None
-    st = await login.get_login_status(db, uk)  # 尝试 SSO 复登
+    st = await login.get_login_status(db, uk)  # 无 token：尝试静默 SSO 复登
     if st.get("logged_in"):
         return manager.peek(uk), None
     return None, {"ok": False, "code": "NEED_LOGIN",

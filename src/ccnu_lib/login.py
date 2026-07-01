@@ -1,148 +1,121 @@
-"""登录状态机：竞速等待 + 挂起式 challenge。
+"""登录状态机（纯 HTTP CAS SSO）。
 
-跨 MCP 调用的"会话独占"用 session.pending 标志实现：
-有 pending challenge 时，新动作直接拒绝，必须先 submit_challenge 或等其过期。
+流程：getSysSet 取配置 → GET {CAS}/static/sso/login?redirectUrl={VUE} 跟随重定向
+  · 落到 CAS 登录表单(200) → 未登录：抓验证码返回 NEED_CHALLENGE
+  · 直接跳回 VUESERVICE 带 ?token=<JWT>（CASTGC 有效时的静默 SSO）→ 已登录
+submit_challenge：POST CAS 表单 → 跟随 ticket → 拿 JWT → auth/cas 换 app token。
+
+"会话独占"仍用 session.pending：有挂起 challenge 时新动作返回 CHALLENGE_PENDING。
+登录态保活靠持久化 cookie（CASTGC）支持静默重登 + 缓存的 app token。
 """
 from __future__ import annotations
 
-import asyncio
+import re
 
-from playwright.async_api import Page
+import httpx
 
-from . import selectors as S
-from .browser import Session, manager
-from .challenges import create_challenge
+from . import api
 from .config import settings
 from .db import Database
+from .http_client import Session, manager
+
+CAPTCHA_URL = "https://account.ccnu.edu.cn/cas/captcha.jpg"
+_ERROR_HINTS = ["用户名或密码", "密码错误", "认证信息无效", "认证失败",
+                "验证码错误", "验证码不正确", "无效的验证码", "账号被锁定"]
 
 
-# ---------- 页面判定 ----------
-async def _visible(page: Page, selector: str) -> bool:
-    try:
-        loc = page.locator(selector).first
-        return await loc.count() > 0 and await loc.is_visible()
-    except Exception:
-        return False
+# ---------- 系统配置 / 签名密钥 ----------
+async def ensure_syscfg(sess: Session) -> None:
+    if sess.realkey and sess.syscfg:
+        return
+    data = await api.get_sys_set(sess.client)
+    sess.syscfg = data
+    if data.get("hmac") == 1 and data.get("hmacKey"):
+        sess.realkey = api.derive_realkey(data["hmacKey"])
 
 
-async def _has_token(page: Page) -> bool:
-    """SPA 把会话 token 存进 sessionStorage.jsq_p-token，这才是 API 可用的真凭证。"""
-    try:
-        tok = await page.evaluate("() => sessionStorage.getItem('jsq_p-token')")
-        return bool(tok)
-    except Exception:
-        return False
+def _cas_urls(sess: Session) -> tuple[str, str]:
+    vc = (sess.syscfg or {}).get("vueConfig") or {}
+    return vc.get("CASSSERVICE", ""), vc.get("VUESERVICE", "")
 
 
-async def is_logged_in(page: Page) -> bool:
-    url = page.url or ""
-    # 在 CAS 登录页（account.ccnu.edu.cn / /cas/login）一定是未登录
-    if any(m in url for m in S.LOGIN_URL_MARKERS):
-        return False
-    if await _visible(page, S.LOGIN_PAGE_MARKERS):
-        return False
-    # 回到预约域（kjyy）且 SPA 已取得会话 token → 真正可用
-    if S.LOGGED_IN_HOST in url:
-        return await _has_token(page)
-    return False
+# ---------- CAS 链跟随 ----------
+def _parse_params(url: str) -> dict[str, str]:
+    q = url.split("?", 1)[1] if "?" in url else ""
+    q = q.split("#")[0]
+    out: dict[str, str] = {}
+    for kv in q.split("&"):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            out.setdefault(k, v)
+    return out
 
 
-async def _wait_settled(page: Page, seconds: float = 15.0) -> str:
-    """等 CAS 重定向/SSO 链稳定，返回 'logged_in' 或 'login_form'。
-
-    关键：不能一看到 kjyy 域就判已登录——未登录时会先闪一下 kjyy 再跳回 CAS。
-    要求回到 kjyy 域且 SPA 已存好 token，才算真登录。
-
-    轮询 0.25s 一次并尽早短路：哪个状态先确定就立刻返回，不傻等满超时。
-    """
-    step = 0.25
-    for _ in range(int(seconds / step)):
-        if await _visible(page, S.PASSWORD_INPUT):
-            return "login_form"  # 渲染出密码框 = 确定要登录
-        if S.LOGGED_IN_HOST in (page.url or "") and await _has_token(page):
-            return "logged_in"   # 回到 kjyy 且 SPA 已存好 token
-        await asyncio.sleep(step)
-    if await _visible(page, S.PASSWORD_INPUT):
-        return "login_form"
-    return "timeout"
+def _parse_cas_form(page_url: str, body: str) -> dict:
+    def g(pat):
+        m = re.search(pat, body)
+        return m.group(1) if m else None
+    action = g(r'<form[^>]*action="([^"]+)"')
+    return {
+        "cas_login_url": str(httpx.URL(page_url).join(action)) if action else page_url,
+        "lt": g(r'name="lt" value="([^"]+)"'),
+        "execution": g(r'name="execution" value="([^"]+)"'),
+    }
 
 
-async def _error_text(page: Page) -> str | None:
-    try:
-        body = await page.inner_text("body")
-    except Exception:
-        return None
-    for hint in S.ERROR_HINTS:
-        if hint in body:
-            return hint
+async def _sso_walk(sess: Session) -> tuple[str, dict]:
+    """GET sso/login 跟随重定向。返回 ('token', params) / ('form', ctx) / ('unknown', {})。"""
+    cas, vue = _cas_urls(sess)
+    if not cas or not vue:
+        return "unknown", {}
+    resp = await sess.client.get(f"{cas}/static/sso/login?redirectUrl={vue}")
+    for _ in range(10):
+        loc = resp.headers.get("location")
+        if not loc:
+            body = resp.text
+            if 'name="execution"' in body:
+                return "form", _parse_cas_form(str(resp.url), body)
+            return "unknown", {}
+        nxt = str(httpx.URL(str(resp.url)).join(loc))
+        if "jsq-v" in nxt:
+            return "token", _parse_params(nxt)
+        resp = await sess.client.get(nxt)
+    return "unknown", {}
+
+
+async def _follow_to_token(sess: Session, resp: httpx.Response) -> dict | None:
+    """从一个 302 响应继续跟随，直到回到 VUESERVICE 抓到 token 参数。"""
+    for _ in range(10):
+        loc = resp.headers.get("location")
+        if not loc:
+            return None
+        nxt = str(httpx.URL(str(resp.url)).join(loc))
+        if "jsq-v" in nxt:
+            return _parse_params(nxt)
+        resp = await sess.client.get(nxt)
     return None
 
 
-# ---------- 提交后竞速判定 ----------
-async def _evaluate_after_submit(db: Database, sess: Session) -> dict:
-    """点击登录后，竞速等待：成功 / 短信页 / 错误，最多约 12s。
-
-    轮询 0.25s 并尽早短路：登录成功通常 1~3s 内 token 就进 sessionStorage，
-    一旦命中立刻返回，不傻等满超时。
-    """
-    page = sess.page
-    step = 0.25
-    for _ in range(int(12 / step)):
-        if await is_logged_in(page):
-            return await _mark_success(db, sess)
-        if await _visible(page, S.SMS_INPUT):
-            return await _make_sms_challenge(db, sess)
-        if await _visible(page, S.SMS_SEND_BUTTON) and not await _visible(page, S.SMS_INPUT):
-            return await _make_confirm_send_sms(db, sess)
-        err = await _error_text(page)
-        if err:
-            sess.pending = None  # 失败：清挂起，允许重新 start_login
-            db.update_session(sess.user_key, status="login_failed", error=err)
-            return {"ok": False, "code": "LOGIN_FAILED",
-                    "message": f"登录失败：{err}（验证码已刷新，请重新 start_login）"}
-        await asyncio.sleep(step)
-    # 既没成功也没明确失败：交人工兜底
-    res = await create_challenge(
-        db, page, sess.user_key, "manual_login",
-        "自动登录未能确认结果，请在浏览器中手动完成登录后再调用 get_login_status",
-    )
-    sess.pending = {"challenge_id": res["challenge_id"], "type": "manual_login"}
-    return res
+async def _exchange(db: Database, sess: Session, params: dict) -> dict:
+    """用 CAS 回跳的 JWT 换 app token，成功即标记登录。"""
+    cas_token = params.get("token")
+    if not cas_token:
+        return {"ok": False, "code": "NO_CAS_TOKEN", "message": "SSO 未返回 token"}
+    app_token = await api.auth_cas(sess.client, cas_token, params)
+    if not app_token:
+        return {"ok": False, "code": "AUTH_EXCHANGE_FAILED", "message": "app token 换取失败"}
+    sess.token = app_token
+    return await _mark_success(db, sess)
 
 
 async def _mark_success(db: Database, sess: Session) -> dict:
     sess.pending = None
+    sess.login_ctx = None
     db.set_login_status(sess.user_key, "logged_in")
     db.update_session(sess.user_key, status="logged_in", logged_in=True, error=None)
-    await manager.save_cookies(sess.user_key)  # 存盘以便跨进程免登录
+    await manager.save(sess.user_key)
     return {"ok": True, "user_key": sess.user_key, "status": "logged_in",
             "logged_in": True, "message": "登录成功"}
-
-
-async def _make_sms_challenge(db: Database, sess: Session) -> dict:
-    phone_hint = None
-    try:
-        loc = sess.page.locator(S.PHONE_HINT_TEXT).first
-        if await loc.count() > 0:
-            phone_hint = (await loc.inner_text()).strip()
-    except Exception:
-        pass
-    res = await create_challenge(
-        db, sess.page, sess.user_key, "sms",
-        "因 IP 变化等需要短信验证码，请输入收到的短信验证码",
-        phone_hint=phone_hint,
-    )
-    sess.pending = {"challenge_id": res["challenge_id"], "type": "sms"}
-    return res
-
-
-async def _make_confirm_send_sms(db: Database, sess: Session) -> dict:
-    res = await create_challenge(
-        db, sess.page, sess.user_key, "confirm_send_sms",
-        "需要短信验证码。提交任意值以确认发送短信（避免误触发风控）",
-    )
-    sess.pending = {"challenge_id": res["challenge_id"], "type": "confirm_send_sms"}
-    return res
 
 
 # ---------- 对外：start_login ----------
@@ -159,50 +132,34 @@ async def start_login(db: Database, user_key: str) -> dict:
         return {"ok": False, "code": "NO_ACCOUNT", "message": "未保存账号，请先 save_account"}
 
     async with sess.lock:
-        page = sess.page
         try:
-            await page.goto(settings.base_url, wait_until="domcontentloaded", timeout=30000)
+            await ensure_syscfg(sess)
         except Exception as e:
-            db.update_session(user_key, status="error", error=str(e))
-            return {"ok": False, "code": "NAV_FAILED", "message": f"打开页面失败：{e}"}
+            return {"ok": False, "code": "SYSCFG_FAILED", "message": f"取系统配置失败：{e}"}
 
-        # 等重定向链/CAS SSO 跳转 settle，再决定登录还是已登录
-        state = await _wait_settled(page)
-        if state == "logged_in":
-            return await _mark_success(db, sess)
-        if state == "timeout":
+        try:
+            kind, ctx = await _sso_walk(sess)
+        except Exception as e:
+            return {"ok": False, "code": "SSO_FAILED", "message": f"SSO 链失败：{e}"}
+
+        if kind == "token":  # CASTGC 有效，静默登录
+            return await _exchange(db, sess, ctx)
+        if kind != "form":
             return {"ok": False, "code": "AUTH_UNSETTLED",
-                    "message": "页面停在 kjyy 但未取得会话 token，请重试 start_login"}
+                    "message": "SSO 链未落到登录表单也未拿到 token，请重试"}
 
-        # 填账号密码（填到一半若 SSO 突然完成跳走，回查登录态）
+        # 落到 CAS 登录表单 → 抓验证码，转人工
+        sess.login_ctx = ctx
         try:
-            await page.fill(S.USERNAME_INPUT, account["username"], timeout=8000)
-            await page.fill(S.PASSWORD_INPUT, account["password"], timeout=8000)
-        except Exception as e:
-            if await is_logged_in(page):
-                return await _mark_success(db, sess)
-            return {"ok": False, "code": "LOGIN_FORM_NOT_FOUND",
-                    "message": f"未定位到登录表单：{e}"}
-
-        # 验证码：有时有有时无，动态检测
-        if await _visible(page, S.CAPTCHA_INPUT):
-            res = await create_challenge(
-                db, page, user_key, "captcha", "请输入图形验证码",
-                image_selector=S.CAPTCHA_IMAGE,
-            )
-            sess.pending = {"challenge_id": res["challenge_id"], "type": "captcha"}
-            return res
-
-        # 无验证码，直接登录
-        await _click_login(page)
-        return await _evaluate_after_submit(db, sess)
-
-
-async def _click_login(page: Page) -> None:
-    try:
-        await page.click(S.LOGIN_BUTTON, timeout=8000)
-    except Exception:
-        await page.keyboard.press("Enter")
+            cap = await sess.client.get(CAPTCHA_URL)
+            image_bytes = cap.content
+        except Exception:
+            image_bytes = None
+        from .challenges import create_challenge
+        res = create_challenge(db, user_key, "captcha", "请输入图形验证码",
+                               image_bytes=image_bytes, image_mime="image/jpeg")
+        sess.pending = {"challenge_id": res["challenge_id"], "type": "captcha"}
+        return res
 
 
 # ---------- 对外：submit_challenge ----------
@@ -217,34 +174,47 @@ async def submit_challenge(db: Database, user_key: str, challenge_id: str, answe
     if sess is None or sess.pending is None or sess.pending["challenge_id"] != challenge_id:
         db.set_challenge_status(challenge_id, "expired")
         return {"ok": False, "code": "SESSION_LOST",
-                "message": "挂起的浏览器会话已丢失（可能超时或重启），请重新 start_login"}
+                "message": "挂起的会话已丢失（可能超时或重启），请重新 start_login"}
 
     async with sess.lock:
-        page = sess.page
-        ctype = sess.pending["type"]
+        ctx = sess.login_ctx or {}
+        account = db.get_account(user_key) or {}
+        form = {
+            "username": account.get("username", ""),
+            "password": account.get("password", ""),
+            "captcha": answer,
+            "lt": ctx.get("lt", ""),
+            "execution": ctx.get("execution", "e1s1"),
+            "_eventId": "submit",
+            "submit": "登录",
+        }
         try:
-            if ctype == "captcha":
-                await page.fill(S.CAPTCHA_INPUT, answer, timeout=8000)
-                await _click_login(page)
-            elif ctype == "sms":
-                await page.fill(S.SMS_INPUT, answer, timeout=8000)
-                await _click_login(page)
-            elif ctype == "confirm_send_sms":
-                await page.click(S.SMS_SEND_BUTTON, timeout=8000)
-                await page.wait_for_timeout(1500)
-                db.set_challenge_status(challenge_id, "resolved")
-                return await _make_sms_challenge(db, sess)
-            else:  # manual_login
-                if await is_logged_in(page):
-                    db.set_challenge_status(challenge_id, "resolved")
-                    return await _mark_success(db, sess)
-                return {"ok": False, "code": "STILL_NOT_LOGGED_IN",
-                        "message": "仍未登录，请继续手动操作"}
+            resp = await sess.client.post(
+                ctx.get("cas_login_url", ""), data=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "Referer": ctx.get("cas_login_url", "")},
+            )
         except Exception as e:
             return {"ok": False, "code": "SUBMIT_FAILED", "message": str(e)}
 
         db.set_challenge_status(challenge_id, "resolved")
-        return await _evaluate_after_submit(db, sess)
+
+        # 仍停在登录表单 = 登录失败（验证码/密码错），验证码已刷新需重来
+        if resp.status_code == 200 and 'name="execution"' in resp.text:
+            sess.pending = None
+            sess.login_ctx = None
+            err = next((h for h in _ERROR_HINTS if h in resp.text), "认证失败")
+            db.update_session(user_key, status="login_failed", error=err)
+            return {"ok": False, "code": "LOGIN_FAILED",
+                    "message": f"登录失败：{err}（验证码已刷新，请重新 start_login）"}
+
+        params = await _follow_to_token(sess, resp)
+        if not params:
+            sess.pending = None
+            sess.login_ctx = None
+            return {"ok": False, "code": "AUTH_UNSETTLED",
+                    "message": "提交后未拿到 token，请重新 start_login"}
+        return await _exchange(db, sess, params)
 
 
 # ---------- 对外：get_login_status（实地探测） ----------
@@ -252,23 +222,26 @@ async def get_login_status(db: Database, user_key: str) -> dict:
     account = db.get_account(user_key)
     if not account:
         return {"ok": True, "user_key": user_key, "logged_in": False,
-                "status": "no_account", "needs_challenge": False,
-                "message": "未保存账号"}
+                "status": "no_account", "needs_challenge": False, "message": "未保存账号"}
     sess = await manager.get_session(user_key)
     async with sess.lock:
-        page = sess.page
         try:
-            await page.goto(settings.base_url, wait_until="domcontentloaded", timeout=30000)
+            await ensure_syscfg(sess)
+            kind, ctx = await _sso_walk(sess)
         except Exception as e:
             db.update_session(user_key, status="error", error=str(e))
             return {"ok": False, "user_key": user_key, "logged_in": False,
                     "status": "error", "message": str(e)}
-        logged = await _wait_settled(page) == "logged_in"
+        logged = False
+        if kind == "token":
+            try:
+                await _exchange(db, sess, ctx)
+                logged = True
+            except Exception:
+                logged = False
         status = "logged_in" if logged else "logged_out"
         db.set_login_status(user_key, status)
         db.update_session(user_key, status=status, logged_in=logged)
-        if logged:
-            await manager.save_cookies(user_key)  # 刷新存盘的会话 cookie
         return {"ok": True, "user_key": user_key, "logged_in": logged,
                 "status": status, "needs_challenge": False,
                 "message": "当前登录态可用" if logged else "登录态已失效，请 start_login"}

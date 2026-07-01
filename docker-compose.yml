@@ -9,14 +9,11 @@ services:
       - .env
     environment:
       DATA_DIR: /data
-      HEADLESS: "true"
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8010"
-      CCNU_BASE_URL: "https://kjyy.ccnu.edu.cn/jsq-v/#/main/home"
       CHALLENGE_TTL_SECONDS: "240"
     ports:
       - "8010:8010"
     volumes:
-      - ./data:/data        # 持久化 profile / cookies / SQLite / 截图，重启后免登录
-    shm_size: "1gb"         # Chromium 共享内存，过小会随机崩页
+      - ./data:/data        # 持久化 session.json(cookie+token) / SQLite / 验证码图，重启后静默 SSO 免登录
     restart: unless-stopped
