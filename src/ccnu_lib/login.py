@@ -10,7 +10,9 @@ submit_challenge：POST CAS 表单 → 跟随 ticket → 拿 JWT → auth/cas �
 """
 from __future__ import annotations
 
+import base64
 import re
+import time
 
 import httpx
 
@@ -119,13 +121,39 @@ async def _mark_success(db: Database, sess: Session) -> dict:
 
 
 # ---------- 对外：start_login ----------
+def _pending_challenge_response(row: dict) -> dict:
+    image_base64 = None
+    screenshot_path = row.get("screenshot_path")
+    if screenshot_path:
+        try:
+            raw = open(screenshot_path, "rb").read()
+            mime = "image/png" if str(screenshot_path).lower().endswith(".png") else "image/jpeg"
+            image_base64 = f"data:{mime};base64," + base64.b64encode(raw).decode()
+        except OSError:
+            image_base64 = None
+    res = {
+        "ok": False,
+        "code": "NEED_CHALLENGE",
+        "challenge_id": row["challenge_id"],
+        "challenge_type": row.get("type") or "captcha",
+        "prompt": row.get("prompt") or "请输入图形验证码",
+        "expires_at": row.get("expires_at"),
+    }
+    if image_base64:
+        res["image_base64"] = image_base64
+        res["screenshot_path"] = screenshot_path
+    return res
+
+
 async def start_login(db: Database, user_key: str) -> dict:
     sess = await manager.get_session(user_key)
     db.expire_stale_challenges(user_key)
     if sess.pending:
-        return {"ok": False, "code": "CHALLENGE_PENDING",
-                "message": "存在待处理的 challenge，请先 submit_challenge",
-                "challenge_id": sess.pending["challenge_id"]}
+        row = db.get_pending_challenge(user_key, sess.pending["challenge_id"])
+        if row and int(row.get("expires_at") or 0) >= int(time.time()):
+            return _pending_challenge_response(row)
+        sess.pending = None
+        sess.login_ctx = None
 
     account = db.get_account(user_key)
     if not account or not account.get("username"):

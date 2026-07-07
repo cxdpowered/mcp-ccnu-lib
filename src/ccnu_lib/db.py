@@ -130,6 +130,13 @@ class Database:
             "SELECT * FROM library_challenges WHERE challenge_id=?", (challenge_id,)
         )
 
+    def get_pending_challenge(self, user_key: str, challenge_id: str) -> dict[str, Any] | None:
+        return self._query_one(
+            """SELECT * FROM library_challenges
+               WHERE user_key=? AND challenge_id=? AND status='pending'""",
+            (user_key, challenge_id),
+        )
+
     def set_challenge_status(self, challenge_id: str, status: str) -> None:
         self._exec(
             "UPDATE library_challenges SET status=? WHERE challenge_id=?",

@@ -16,7 +16,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MCP_PORT=8010
 COPY --from=builder /install /usr/local
 RUN useradd --create-home app && mkdir -p /data && chown app:app /data
-USER app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+USER root
 WORKDIR /app
 EXPOSE 8010
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "-m", "ccnu_lib.server"]
